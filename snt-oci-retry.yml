@@ -1,0 +1,73 @@
+name: SNT OCI capacity retry
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *' # UTC; roughly every 15 minutes, with possible GitHub delays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write # Only to disable this workflow after success or a non-capacity error
+
+concurrency:
+  group: snt-oci-capacity-retry
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      OCI_STACK_ID: ${{ vars.OCI_STACK_ID }}
+      OCI_STACK_CONFIG_SHA256: ${{ vars.OCI_STACK_CONFIG_SHA256 }}
+      OCI_STACK_VARIABLES_SHA256: ${{ vars.OCI_STACK_VARIABLES_SHA256 }}
+      MAX_ATTEMPTS: '1344' # Up to about 14 days of 15-minute capacity retries
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Oracle CLI
+        run: python -m pip install --disable-pip-version-check 'oci-cli==3.94.0'
+      - name: Configure OCI API authentication
+        env:
+          OCI_API_PRIVATE_KEY: ${{ secrets.OCI_API_PRIVATE_KEY }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_API_FINGERPRINT: ${{ secrets.OCI_API_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          : "${OCI_API_PRIVATE_KEY:?Missing API private key}"
+          : "${OCI_TENANCY_OCID:?Missing tenancy OCID}"
+          : "${OCI_USER_OCID:?Missing user OCID}"
+          : "${OCI_API_FINGERPRINT:?Missing fingerprint}"
+          umask 077
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_API_PRIVATE_KEY" > "$HOME/.oci/api_key.pem"
+          {
+            printf '[DEFAULT]\n'
+            printf 'user=%s\n' "$OCI_USER_OCID"
+            printf 'fingerprint=%s\n' "$OCI_API_FINGERPRINT"
+            printf 'key_file=%s/.oci/api_key.pem\n' "$HOME"
+            printf 'tenancy=%s\n' "$OCI_TENANCY_OCID"
+            printf 'region=ap-tokyo-1\n'
+          } > "$HOME/.oci/config"
+      - id: attempt
+        name: Retry the saved stack
+        run: |
+          if ! bash scripts/retry_oci_stack.sh; then
+            echo 'result=BLOCKED' >> "$GITHUB_OUTPUT"
+            echo 'OCI command failed; automatic retries will be disabled.'
+          fi
+      - name: Stop schedule after success or unexpected error
+        if: ${{ always() && (failure() || steps.attempt.outputs.result == 'SUCCESS' || steps.attempt.outputs.result == 'BLOCKED') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/snt-oci-retry.yml/disable"
+      - name: Mark unexpected result for attention
+        if: steps.attempt.outputs.result == 'BLOCKED'
+        run: |
+          echo 'Check this run and the OCI Resource Manager Jobs page.'
+          exit 1
